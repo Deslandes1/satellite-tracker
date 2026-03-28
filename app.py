@@ -3,6 +3,7 @@ import pandas as pd
 import requests
 import plotly.graph_objects as go
 from datetime import datetime
+import time
 
 # -------------------------------------------------------------------
 # Helper functions
@@ -26,11 +27,42 @@ def get_satellite_list():
         40967: "Cubesat",
     }
 
-def fetch_satellite_data(sat_id, api_key, seconds=7200):
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_all_satellites(api_key, satellite_dict):
     """
-    Fetch current position and predicted positions for the next `seconds` seconds.
-    Returns a dict with 'current' (single position) and 'track' (list of positions).
+    Fetch current position for all satellites in the dictionary.
+    Returns a DataFrame with columns: ID, Name, Latitude, Longitude, Altitude, Speed, LastUpdate
     """
+    results = []
+    for sat_id, sat_name in satellite_dict.items():
+        try:
+            url = f"https://api.n2yo.com/rest/v1/satellite/positions/{sat_id}/0/0/0/1/&apiKey={api_key}"
+            resp = requests.get(url, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                if 'positions' in data and data['positions']:
+                    pos = data['positions'][0]
+                    results.append({
+                        "ID": sat_id,
+                        "Name": sat_name,
+                        "Latitude": pos['satlatitude'],
+                        "Longitude": pos['satlongitude'],
+                        "Altitude (km)": pos['sataltitude'],
+                        "Speed (km/s)": pos['satvelocity'],
+                        "Last Update": datetime.fromtimestamp(pos['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+                    })
+                else:
+                    results.append({"ID": sat_id, "Name": sat_name, "Error": "No position data"})
+            else:
+                results.append({"ID": sat_id, "Name": sat_name, "Error": f"HTTP {resp.status_code}"})
+        except Exception as e:
+            results.append({"ID": sat_id, "Name": sat_name, "Error": str(e)})
+        # Sleep to respect rate limit (10 requests/min)
+        time.sleep(1.5)
+    return pd.DataFrame(results)
+
+def fetch_satellite_details(sat_id, api_key, seconds=7200):
+    """Fetch current position and predicted track for a single satellite."""
     url = f"https://api.n2yo.com/rest/v1/satellite/positions/{sat_id}/0/0/0/{seconds}/&apiKey={api_key}"
     try:
         resp = requests.get(url, timeout=10)
@@ -39,16 +71,14 @@ def fetch_satellite_data(sat_id, api_key, seconds=7200):
             if 'info' in data and 'positions' in data:
                 positions = data['positions']
                 if positions:
-                    # The first position is the current one
-                    current = positions[0]
-                    # The rest (or all) can be used for the track
-                    track = positions
-                    return {'current': current, 'track': track, 'satname': data['info']['satname']}
-        st.warning(f"API returned status {resp.status_code}")
-        return None
+                    return {
+                        'current': positions[0],
+                        'track': positions,
+                        'satname': data['info']['satname']
+                    }
     except Exception as e:
-        st.error(f"Error fetching data: {e}")
-        return None
+        st.error(f"Error fetching details: {e}")
+    return None
 
 def fetch_passes(sat_id, lat, lon, api_key, days=2):
     """Get next passes over given location."""
@@ -68,7 +98,7 @@ def fetch_passes(sat_id, lat, lon, api_key, days=2):
 # -------------------------------------------------------------------
 st.set_page_config(page_title="Satellite Tracker", layout="wide")
 st.title("🛰️ Satellite Tracker")
-st.markdown("Real‑time positions and predicted ground tracks | Powered by N2YO")
+st.markdown("Real‑time positions and ground tracks | Powered by N2YO")
 
 # Sidebar for settings
 with st.sidebar:
@@ -83,37 +113,69 @@ with st.sidebar:
         st.warning("Please enter your N2YO API key to use the tracker.")
         st.stop()
 
-    satellites = get_satellite_list()
-    selected_sat_id = st.selectbox(
-        "Select Satellite",
-        options=list(satellites.keys()),
-        format_func=lambda x: satellites[x]
-    )
-
-    # Auto‑refresh
-    st.divider()
     auto_refresh = st.checkbox("Auto‑refresh", value=False)
     if auto_refresh:
         refresh_sec = st.number_input("Refresh interval (seconds)", min_value=10, max_value=300, value=60, step=10)
 
-    # User location for passes
     st.divider()
     st.subheader("Predict passes over:")
     user_lat = st.number_input("Latitude", value=40.7128, format="%.5f")
     user_lon = st.number_input("Longitude", value=-74.0060, format="%.5f")
 
     if st.button("Refresh Data", use_container_width=True):
+        st.cache_data.clear()
         st.rerun()
 
+# -------------------------------------------------------------------
 # Main content
+# -------------------------------------------------------------------
 if api_key:
-    with st.spinner("Fetching satellite data..."):
-        data = fetch_satellite_data(selected_sat_id, api_key, seconds=7200)
+    satellites_dict = get_satellite_list()
 
-    if data and data['current']:
-        current = data['current']
-        track = data['track']
-        sat_name = data['satname']
+    # Fetch all satellites with a spinner
+    with st.spinner("Fetching satellite positions (this may take 30 seconds)..."):
+        df_satellites = fetch_all_satellites(api_key, satellites_dict)
+
+    # Remove rows with errors
+    if 'Error' in df_satellites.columns:
+        error_rows = df_satellites[df_satellites['Error'].notna()]
+        if not error_rows.empty:
+            st.warning(f"Could not fetch data for: {', '.join(error_rows['Name'])}")
+        df_satellites = df_satellites[df_satellites['Error'].isna()].drop(columns=['Error'], errors='ignore')
+
+    if df_satellites.empty:
+        st.error("No satellite data available. Check your API key or try again later.")
+        st.stop()
+
+    # Display table of satellites
+    st.subheader("📋 Satellite Positions")
+    st.dataframe(df_satellites, use_container_width=True)
+
+    # Download full table as CSV
+    csv = df_satellites.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download All Satellite Data (CSV)",
+        data=csv,
+        file_name=f"satellites_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True
+    )
+
+    # Satellite selection
+    selected_name = st.selectbox("Select satellite for detailed view", df_satellites['Name'].tolist())
+    selected_row = df_satellites[df_satellites['Name'] == selected_name].iloc[0]
+    selected_id = selected_row['ID']
+
+    # -------------------------------------------------------------------
+    # Detailed view for selected satellite
+    # -------------------------------------------------------------------
+    with st.spinner(f"Fetching detailed track and passes for {selected_name}..."):
+        details = fetch_satellite_details(selected_id, api_key, seconds=7200)
+
+    if details:
+        current = details['current']
+        track = details['track']
+        sat_name = details['satname']
 
         # Current position info
         lat = current['satlatitude']
@@ -130,14 +192,12 @@ if api_key:
         col1.metric("Speed", f"{vel:.2f} km/s")
         col2.metric("Last Updated", timestamp)
 
-        # Map with current position and predicted ground track
-        st.subheader("Current Position & Predicted Ground Track (next 2 hours)")
-        # Prepare track coordinates
+        # Map with ground track
+        st.subheader("🗺️ Current Position & Predicted Ground Track (next 2 hours)")
         track_lons = [p['satlongitude'] for p in track]
         track_lats = [p['satlatitude'] for p in track]
 
         fig = go.Figure()
-        # Ground track (line)
         fig.add_trace(go.Scattergeo(
             lon=track_lons,
             lat=track_lats,
@@ -145,7 +205,6 @@ if api_key:
             line=dict(width=1, color='rgba(100, 200, 255, 0.7)'),
             name='Predicted Track'
         ))
-        # Current position marker
         fig.add_trace(go.Scattergeo(
             lon=[lon],
             lat=[lat],
@@ -167,7 +226,7 @@ if api_key:
 
         # Pass predictions
         st.subheader("🔭 Next Passes Over Your Location")
-        passes = fetch_passes(selected_sat_id, user_lat, user_lon, api_key, days=2)
+        passes = fetch_passes(selected_id, user_lat, user_lon, api_key, days=2)
         if passes:
             df_passes = pd.DataFrame(passes)
             df_passes['startUTC'] = pd.to_datetime(df_passes['startUTC'], unit='s')
@@ -182,8 +241,32 @@ if api_key:
             st.dataframe(display_df, use_container_width=True)
         else:
             st.info("No passes predicted in the next 2 days.")
+
+        # Download report for selected satellite
+        report_text = f"""
+SATELLITE REPORT
+================
+Name: {sat_name}
+ID: {selected_id}
+Current position:
+  Latitude: {lat:.5f}°
+  Longitude: {lon:.5f}°
+  Altitude: {alt:.1f} km
+  Speed: {vel:.2f} km/s
+  Last update: {timestamp}
+
+Ground track: {len(track)} predicted positions over the next 2 hours.
+Pass predictions over ({user_lat}, {user_lon}): {'See table above' if passes else 'None in next 2 days.'}
+"""
+        st.download_button(
+            label="📥 Download Report (TXT)",
+            data=report_text,
+            file_name=f"{sat_name}_report.txt",
+            mime="text/plain",
+            use_container_width=True
+        )
     else:
-        st.error("Could not retrieve satellite data. Check your API key or satellite ID.")
+        st.error(f"Could not retrieve detailed data for {selected_name}.")
 
 # Auto‑refresh script
 if auto_refresh:
