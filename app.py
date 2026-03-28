@@ -26,20 +26,26 @@ def get_satellite_list():
         40967: "Cubesat",
     }
 
-def fetch_satellite_data(sat_id, api_key):
-    """Get current position from N2YO API."""
-    url = f"https://api.n2yo.com/rest/v1/satellite/positions/{sat_id}/0/0/0/1/&apiKey={api_key}"
+def fetch_satellite_data(sat_id, api_key, seconds=7200):
+    """
+    Fetch current position and predicted positions for the next `seconds` seconds.
+    Returns a dict with 'current' (single position) and 'track' (list of positions).
+    """
+    url = f"https://api.n2yo.com/rest/v1/satellite/positions/{sat_id}/0/0/0/{seconds}/&apiKey={api_key}"
     try:
         resp = requests.get(url, timeout=10)
         if resp.status_code == 200:
             data = resp.json()
-            if 'info' in data and data['info']['satname']:
-                return data
-            else:
-                return None
-        else:
-            st.warning(f"API returned status {resp.status_code}")
-            return None
+            if 'info' in data and 'positions' in data:
+                positions = data['positions']
+                if positions:
+                    # The first position is the current one
+                    current = positions[0]
+                    # The rest (or all) can be used for the track
+                    track = positions
+                    return {'current': current, 'track': track, 'satname': data['info']['satname']}
+        st.warning(f"API returned status {resp.status_code}")
+        return None
     except Exception as e:
         st.error(f"Error fetching data: {e}")
         return None
@@ -53,35 +59,30 @@ def fetch_passes(sat_id, lat, lon, api_key, days=2):
             data = resp.json()
             if 'passes' in data:
                 return data['passes']
-            else:
-                return []
-        else:
-            return []
     except:
-        return []
+        pass
+    return []
 
 # -------------------------------------------------------------------
 # Streamlit UI
 # -------------------------------------------------------------------
 st.set_page_config(page_title="Satellite Tracker", layout="wide")
 st.title("🛰️ Satellite Tracker")
-st.markdown("Real‑time positions of satellites | Powered by N2YO")
+st.markdown("Real‑time positions and predicted ground tracks | Powered by N2YO")
 
 # Sidebar for settings
 with st.sidebar:
     st.header("Settings")
-    # API key input – you can use your key as default, but it's shown as a placeholder
     api_key = st.text_input(
         "N2YO API Key",
         type="password",
-        value="8TGB9U-SLULC9-N5XN43-5P4U",  # your key (visible to you, but hidden by type="password")
+        value="8TGB9U-SLULC9-N5XN43-5P4U",
         help="Get your free key at n2yo.com"
     )
     if not api_key:
         st.warning("Please enter your N2YO API key to use the tracker.")
         st.stop()
 
-    # Satellite selection
     satellites = get_satellite_list()
     selected_sat_id = st.selectbox(
         "Select Satellite",
@@ -89,6 +90,13 @@ with st.sidebar:
         format_func=lambda x: satellites[x]
     )
 
+    # Auto‑refresh
+    st.divider()
+    auto_refresh = st.checkbox("Auto‑refresh", value=False)
+    if auto_refresh:
+        refresh_sec = st.number_input("Refresh interval (seconds)", min_value=10, max_value=300, value=60, step=10)
+
+    # User location for passes
     st.divider()
     st.subheader("Predict passes over:")
     user_lat = st.number_input("Latitude", value=40.7128, format="%.5f")
@@ -97,21 +105,23 @@ with st.sidebar:
     if st.button("Refresh Data", use_container_width=True):
         st.rerun()
 
-# Main area: map and data
+# Main content
 if api_key:
     with st.spinner("Fetching satellite data..."):
-        data = fetch_satellite_data(selected_sat_id, api_key)
+        data = fetch_satellite_data(selected_sat_id, api_key, seconds=7200)
 
-    if data and 'positions' in data and len(data['positions']) > 0:
-        pos = data['positions'][0]
-        sat_name = data['info']['satname']
-        lat = pos['satlatitude']
-        lon = pos['satlongitude']
-        alt = pos['sataltitude']  # km
-        vel = pos['satvelocity']   # km/s
-        timestamp = datetime.fromtimestamp(pos['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+    if data and data['current']:
+        current = data['current']
+        track = data['track']
+        sat_name = data['satname']
 
-        # Display current info
+        # Current position info
+        lat = current['satlatitude']
+        lon = current['satlongitude']
+        alt = current['sataltitude']
+        vel = current['satvelocity']
+        timestamp = datetime.fromtimestamp(current['timestamp']).strftime('%Y-%m-%d %H:%M:%S')
+
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Satellite", sat_name)
         col2.metric("Latitude", f"{lat:.4f}°")
@@ -120,9 +130,23 @@ if api_key:
         col1.metric("Speed", f"{vel:.2f} km/s")
         col2.metric("Last Updated", timestamp)
 
-        # Map
-        st.subheader("Current Position")
-        fig = go.Figure(go.Scattergeo(
+        # Map with current position and predicted ground track
+        st.subheader("Current Position & Predicted Ground Track (next 2 hours)")
+        # Prepare track coordinates
+        track_lons = [p['satlongitude'] for p in track]
+        track_lats = [p['satlatitude'] for p in track]
+
+        fig = go.Figure()
+        # Ground track (line)
+        fig.add_trace(go.Scattergeo(
+            lon=track_lons,
+            lat=track_lats,
+            mode='lines',
+            line=dict(width=1, color='rgba(100, 200, 255, 0.7)'),
+            name='Predicted Track'
+        ))
+        # Current position marker
+        fig.add_trace(go.Scattergeo(
             lon=[lon],
             lat=[lat],
             mode='markers',
@@ -137,7 +161,7 @@ if api_key:
                 landcolor="rgb(243, 243, 243)",
                 countrycolor="rgb(204, 204, 204)",
             ),
-            title=f"{sat_name} Position"
+            title=f"{sat_name} – Current Position and Predicted Track"
         )
         st.plotly_chart(fig, use_container_width=True)
 
@@ -160,3 +184,12 @@ if api_key:
             st.info("No passes predicted in the next 2 days.")
     else:
         st.error("Could not retrieve satellite data. Check your API key or satellite ID.")
+
+# Auto‑refresh script
+if auto_refresh:
+    st.markdown(
+        f"""
+        <meta http-equiv="refresh" content="{refresh_sec}">
+        """,
+        unsafe_allow_html=True
+    )
